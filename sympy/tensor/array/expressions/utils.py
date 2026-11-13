@@ -2,12 +2,31 @@ from __future__ import annotations
 import bisect
 from collections import defaultdict
 
+from sympy.concrete.summations import Sum
+from sympy.core.function import Lambda
+from sympy.core.symbol import Dummy
 from sympy.core.containers import Tuple
 from sympy.core.numbers import Integer
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sympy.combinatorics import Permutation
+
+
+def _avoid_bound_sum_capture(function, operand):
+    """Keep operand symbols free when substituting into a scalar map."""
+    if not isinstance(function, Lambda):
+        return function
+    conflicts = operand.free_symbols
+    if not any(set(s.bound_symbols) & conflicts for s in function.expr.atoms(Sum)):
+        return function
+    body, restore = function.expr._bound_dummies()
+    body = body.xreplace({
+        temporary: Dummy(original.name, **original.assumptions0)
+        if original in conflicts else original
+        for temporary, original in restore.items()
+    })
+    return Lambda(function.variables, body)
 
 
 def _get_mapping_from_sub_ndim_list(sub_ndim_list):

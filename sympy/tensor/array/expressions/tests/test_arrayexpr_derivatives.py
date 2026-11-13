@@ -1,7 +1,7 @@
 from __future__ import annotations
-from sympy import (exp, log, Matrix, Array, derive_by_array, ImmutableMatrix,
+from sympy import (S, exp, log, Matrix, Array, derive_by_array, ImmutableMatrix,
     ImmutableDenseNDimArray, Transpose, Inverse, Determinant, MatPow, ZeroMatrix,
-    Trace, atan2)
+    Trace, atan2, Sum)
 from sympy.core.symbol import symbols, Dummy
 from sympy.core.function import Lambda
 from sympy.functions.elementary.trigonometric import (cos, sin)
@@ -321,6 +321,47 @@ def test_array_derive_scalar_sums():
     assert array_derive(M3[0, 0] + 2*M3[1, 2], M3).as_explicit() == \
         Matrix([[1, 0, 0], [0, 0, 2], [0, 0, 0]])
     assert (Trace(M3) + k).diff(M3) == Identity(3)
+    assert array_derive(2*k, M3) == ZeroArray(3, 3)
+
+
+def test_elementwise_derivative_array_variable():
+    M = MatrixSymbol("M", 2, 2)
+    for shape in [(3,), (2, 3, 4)]:
+        variable = ArraySymbol("variable", shape)
+        assert array_derive(ElementwiseApplyFunction(sin, M), variable) == \
+            ZeroArray(*shape, 2, 2)
+
+    A3 = ArraySymbol("A3", (2, 2, 2))
+    d = Dummy("d")
+    expr = ArrayElementwiseApplyFunc(Lambda(d, d**2*M[0, 0]), A3)
+    actual = array_derive(expr, M).as_explicit()
+    expected = derive_by_array(expr.as_explicit(), M.as_explicit())
+    assert actual == expected
+
+
+def test_array_derive_bound_sum():
+    M = MatrixSymbol("M", 2, 2)
+    i = symbols("i", integer=True)
+    expr = Sum(M[i, i]**2, (i, 0, 1))
+    actual = array_derive(expr, M).as_explicit()
+    expected = derive_by_array(expr.doit(), M.as_explicit())
+    assert actual == expected
+    assert array_derive(Sum(k, (i, 0, 1)), M) == ZeroArray(2, 2)
+    raises(NotImplementedError,
+           lambda: array_derive(Sum(M[i, i], (i, 0, M[0, 0])), M))
+
+
+def test_array_elementwise_captured_sum():
+    M = MatrixSymbol("M", 2, 2)
+    i = symbols("i", integer=True)
+    d = Dummy("d")
+    function = Lambda(d, sin(Sum(d**i*M[i, i], (i, 0, 1))))
+    expr = ArrayElementwiseApplyFunc(function, M)
+    actual = array_derive(expr, M).as_explicit()
+    explicit = expr.as_explicit().applyfunc(lambda e: e.doit())
+    expected = derive_by_array(explicit, M.as_explicit())
+    assert (actual - expected).applyfunc(lambda e: e.doit().expand()) == \
+        Array.zeros(2, 2, 2, 2)
 
 
 def test_array_applyfunc_derivative_keeps_function_argument():
@@ -332,3 +373,88 @@ def test_array_applyfunc_derivative_keeps_function_argument():
     assert res[0, 0, 0, 0] == exp(A2[0, 0] + 1)
     assert res[1, 1, 1, 1] == exp(A2[1, 1] + 1)
     assert res[0, 0, 1, 1] == 0
+
+
+def test_elementwise_sum_preserves_operand_free_symbols():
+    X = MatrixSymbol("X", 2, 2)
+    i, j = symbols("i j", integer=True)
+    z = Dummy("z")
+    function = Lambda(z, Sum(z*X[i, j], (i, 0, 1), (j, 0, 1)))
+    operand = (i + j)*X
+    coefficient = X[0, 0] + X[0, 1] + X[1, 0] + X[1, 1]
+    ground = (coefficient*operand).as_explicit()
+    expected = derive_by_array(ground, X.as_explicit())
+    for cls in (ElementwiseApplyFunction, ArrayElementwiseApplyFunc):
+        expr = cls(function, operand)
+        bound = next(iter(expr.function.expr.atoms(Sum))).bound_symbols
+        assert not set(bound) & operand.free_symbols
+        assert all(v.is_integer for v in bound)
+        explicit = ImmutableDenseNDimArray(expr.as_explicit())
+        assert (explicit - ImmutableDenseNDimArray(ground)).applyfunc(
+            lambda e: e.doit().expand()) == Array.zeros(2, 2)
+        actual = ImmutableDenseNDimArray(array_derive(expr, X).as_explicit())
+        assert (actual - expected).applyfunc(lambda e: e.doit().expand()) == \
+            Array.zeros(2, 2, 2, 2)
+
+
+def test_elementwise_sum_preserves_singleton_matrix_symbol():
+    X = MatrixSymbol("X", 1, 1)
+    i = symbols("i", integer=True)
+    z = Dummy("z")
+    function = Lambda(z, Sum(i*z, (i, 1, 2)))
+    for cls in (ElementwiseApplyFunction, ArrayElementwiseApplyFunc):
+        expr = cls(function, i*X)
+        assert expr.as_explicit()[0, 0].doit() == 3*i*X[0, 0]
+        actual = array_derive(expr, X).as_explicit()
+        assert actual[0, 0, 0, 0].doit() == 3*i
+
+
+def test_array_derive_dependent_sum_limits():
+    X = MatrixSymbol("X", 2, 2)
+    i, j = symbols("i j", integer=True)
+    cases = [
+        (((i, 0, j), (j, 0, 1)), X[0, 0] + X[0, 1] + X[1, 1]),
+        (((i, 0, j), (j, 2, -1)), -X[0, 0] - X[0, 1] - X[1, 1]),
+        (((i, 2, j), (j, 0, 1)), -X[1, 0]),
+    ]
+    for limits, explicit in cases:
+        actual = array_derive(Sum(X[i, j], *limits), X).as_explicit()
+        expected = derive_by_array(explicit, X.as_explicit())
+        assert actual == expected
+
+
+def test_determinant_derivative_constant_singular_argument():
+    X = MatrixSymbol("X", 2, 2)
+    singular = ImmutableMatrix([[2, 1], [1, S.Half]])
+    assert array_derive(Determinant(singular), X) == ZeroArray(2, 2)
+    assert (Determinant(singular)*Trace(X)).diff(X) == ZeroMatrix(2, 2)
+
+
+def test_determinant_derivative_rank_deficient_products():
+    Y = MatrixSymbol("Y", 2, 3)
+    v = MatrixSymbol("v", 3, 1)
+    for arg, variable in [(Y.T*Y, Y), (v*v.T, v)]:
+        assert array_derive(Determinant(arg), variable) == ZeroArray(*variable.shape)
+        explicit = arg.as_explicit().det().expand()
+        assert explicit == 0
+        assert derive_by_array(explicit, variable.as_explicit()) == Array.zeros(*variable.shape)
+    n = symbols("n", positive=True, integer=True)
+    Z = MatrixSymbol("Z", n, n + 1)
+    assert array_derive(Determinant(Z.T*Z), Z) == ZeroArray(n, n + 1)
+
+
+def test_determinant_derivative_explicit_adjugate():
+    X = MatrixSymbol("X", 2, 2)
+    argument = ImmutableMatrix([[X[0, 0], X[0, 1]], [X[1, 0], X[1, 1]]])
+    actual = array_derive(Determinant(argument), X).as_explicit()
+    expected = derive_by_array(argument.det(), X.as_explicit())
+    assert ImmutableDenseNDimArray(actual) == expected
+    singular = ImmutableMatrix([[2, 1], [1, S.Half]])
+    assert (
+        ImmutableDenseNDimArray(actual.subs(X, singular))
+        == expected.subs(X, singular)
+        == Array([[S.Half, -1], [-1, 2]])
+    )
+    singular_argument = ImmutableMatrix([[X[0, 0], X[0, 1]], [0, 0]])
+    derivative = array_derive(Determinant(singular_argument), X).as_explicit()
+    assert derivative == Array.zeros(2, 2)

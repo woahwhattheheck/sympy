@@ -6,10 +6,13 @@ from sympy.core.singleton import S
 from sympy import MatrixBase, derive_by_array, Integer, Determinant, Function, MatPow, Dummy, Pow, Mul, Add
 from sympy.tensor.array import NDimArray
 from sympy.core.expr import Expr
+from sympy.core.function import Lambda
+from sympy.concrete.summations import Sum
 from sympy.matrices.expressions.diagonal import DiagMatrix, DiagonalMatrix
 from sympy.matrices.expressions.inverse import Inverse
 from sympy.matrices.expressions.trace import Trace
 from sympy.matrices.expressions.matexpr import (MatrixExpr, MatrixSymbol, MatrixElement)
+from sympy.matrices.expressions.matmul import MatMul
 from sympy.matrices.expressions.special import Identity, OneMatrix, MatrixUnit, ZeroMatrix
 from sympy.matrices.expressions.transpose import Transpose
 from sympy.combinatorics.permutations import _af_invert
@@ -55,7 +58,7 @@ def _(expr: Add, x: _ArrayExpr):
 @array_derive.register(Mul)
 def _(expr: Mul, x: _ArrayExpr):
     args = expr.args
-    return ArrayAdd.fromiter([
+    return _array_add(*[
         _array_tensor_product(Mul.fromiter(args[:i]), array_derive(arg, x), Mul.fromiter(args[(i+1):]))
         for i, arg in enumerate(args)
     ])
@@ -94,6 +97,16 @@ def _(expr: Trace, x: _ArrayExpr):
     # the generic ``MatrixExpr`` conversion rule and has to be converted to
     # an array contraction explicitly:
     return array_derive(convert_matrix_to_array(expr), x)
+
+
+@array_derive.register(Sum)
+def _(expr: Sum, x: _ArrayExpr):
+    if any(limit.free_symbols & x.free_symbols for limit in expr.limits):
+        raise NotImplementedError("derivative of a sum with variable limits")
+    result = array_derive(expr.function, x)
+    if isinstance(result, ZeroArray):
+        return result
+    return ArraySum(result, *expr.limits)
 
 
 @array_derive.register(ArrayTensorProduct)
@@ -150,11 +163,25 @@ def _(expr: MatrixSymbol, x: _ArrayExpr):
 @array_derive.register(Determinant)
 def _(expr: Determinant, x: Expr):
     arg = expr.arg
-    arg_inverse = arg.inv()
+    if not arg.free_symbols & x.free_symbols:
+        return ZeroArray(*get_shape(x))
+    if isinstance(arg, MatMul):
+        # A product cannot have greater rank than any of its factors.
+        # A narrower intermediate dimension makes this determinant identically zero.
+        size = arg.shape[0]
+        if any((dimension < size) == True for factor in arg.args
+               for dimension in get_shape(factor)):
+            return ZeroArray(*get_shape(x))
     darg = array_derive(arg, x)
+    if isinstance(darg, ZeroArray):
+        return ZeroArray(*get_shape(x))
     rank_x = len(get_shape(x))
-    tp = _array_tensor_product(expr, arg_inverse, darg)
-    # axes: (0, 1) = arg_inverse, (2, ..., rank_x + 1) = x,
+    if isinstance(arg, MatrixBase):
+        # Jacobi's adjugate formula is polynomial and remains valid at singular matrices.
+        tp = _array_tensor_product(arg.adjugate(), darg)
+    else:
+        tp = _array_tensor_product(expr, Inverse(arg), darg)
+    # axes: (0, 1) = adjugate/inverse, (2, ..., rank_x + 1) = x,
     # (rank_x + 2, rank_x + 3) = matrix axes of darg
     tc = _array_contraction(tp, (0, rank_x + 3), (1, rank_x + 2))
     return tc
@@ -208,10 +235,71 @@ def _(expr: Inverse, x: Expr):
     return pp
 
 
+def _elementwise_parameter_derivatives(function, expr, x, applyfunc):
+    """Chain-rule terms for scalar parameters captured by an elementwise map."""
+    d = Dummy("d")
+    body = function(d)
+    if isinstance(body, Sum):
+        if any(limit.free_symbols & (x.free_symbols | {d})
+               for limit in body.limits):
+            raise NotImplementedError(
+                "elementwise function has variable summation limits")
+        terms = _elementwise_parameter_derivatives(
+            Lambda(d, body.function), expr, x, applyfunc)
+        return [ArraySum(term, *body.limits) for term in terms]
+    replacements = {}
+
+    def collect_parameters(arg):
+        if not arg.free_symbols & x.free_symbols:
+            return
+        if not arg.has(d) or isinstance(arg, Sum):
+            # Treat scalar expressions independent of the map argument as
+            # parameters. A Sum must also keep its bound indices inside
+            # its own derivative, even when its summand depends on d.
+            if get_shape(arg) != ():
+                raise NotImplementedError(
+                    "elementwise function has non-scalar parameter dependence")
+            if arg not in replacements:
+                replacements[arg] = Dummy("p")
+            return
+        if hasattr(arg, "bound_symbols"):
+            raise NotImplementedError(
+                "elementwise parameter differentiation through this binding is not supported")
+        for subarg in arg.args:
+            collect_parameters(subarg)
+
+    collect_parameters(body)
+    if not replacements:
+        return []
+    parameterized = body.xreplace(replacements)
+    restore = {value: key for key, value in replacements.items()}
+    terms = []
+    for parameter, variable in replacements.items():
+        partial = parameterized.diff(variable).xreplace(restore)
+        if parameter.has(d):
+            dparameters = _elementwise_parameter_derivatives(
+                Lambda(d, parameter), expr, x, applyfunc)
+            rank_x = get_ndim(x)
+            rank_expr = get_ndim(expr)
+            for dparameter in dparameters:
+                tp = _array_tensor_product(
+                    dparameter, applyfunc(Lambda(d, partial), expr))
+                terms.append(_array_diagonal(tp, *[
+                    (rank_x + i, rank_x + rank_expr + i)
+                    for i in range(rank_expr)]))
+            continue
+        dparameter = array_derive(parameter, x)
+        # The parameter derivative supplies the leading axes of x; mapping
+        # the scalar partial supplies the trailing axes of the output.
+        terms.append(_array_tensor_product(
+            dparameter, applyfunc(Lambda(d, partial), expr)))
+    return terms
+
+
 @array_derive.register(ElementwiseApplyFunction)
 def _(expr: ElementwiseApplyFunction, x: Expr):
     assert get_ndim(expr) == 2
-    assert get_ndim(x) == 2
+    rank_x = get_ndim(x)
     fdiff = expr._get_function_fdiff()
     dexpr = array_derive(expr.expr, x)
     tp = _array_tensor_product(
@@ -219,9 +307,11 @@ def _(expr: ElementwiseApplyFunction, x: Expr):
         dexpr
     )
     td = _array_diagonal(
-        tp, (0, 4), (1, 5)
+        tp, (0, rank_x + 2), (1, rank_x + 3)
     )
-    return td
+    parameters = _elementwise_parameter_derivatives(
+        expr.function, expr.expr, x, ElementwiseApplyFunction)
+    return _array_add(td, *parameters) if parameters else td
 
 
 @array_derive.register(ArrayElementwiseApplyFunc)
@@ -236,7 +326,10 @@ def _(expr: ArrayElementwiseApplyFunc, x: Expr):
     b = get_ndim(x)
     c = get_ndim(expr)
     diag_indices = [(b + i, b + c + i) for i in range(c)]
-    return _array_diagonal(tp, *diag_indices)
+    td = _array_diagonal(tp, *diag_indices)
+    parameters = _elementwise_parameter_derivatives(
+        expr.function, subexpr, x, ArrayElementwiseApplyFunc)
+    return _array_add(td, *parameters) if parameters else td
 
 
 @array_derive.register(MatrixExpr)

@@ -2,20 +2,45 @@ from __future__ import annotations
 from sympy.concrete.products import (Product, product)
 from sympy.concrete.summations import Sum
 from sympy.core.function import (Derivative, Function, diff)
-from sympy.core.numbers import (Rational, oo, pi)
+from sympy.core.numbers import (I, Rational, oo, pi)
 from sympy.core.singleton import S
 from sympy.core.symbol import (Dummy, Symbol, symbols)
 from sympy.functions.combinatorial.factorials import (rf, factorial)
 from sympy.functions.elementary.exponential import (exp, log)
 from sympy.functions.elementary.miscellaneous import sqrt
+from sympy.functions.elementary.hyperbolic import sinh
 from sympy.functions.elementary.trigonometric import (cos, sin)
 from sympy.functions.special.tensor_functions import KroneckerDelta
+from sympy.functions.special.gamma_functions import gamma
 from sympy.simplify.combsimp import combsimp
 from sympy.simplify.simplify import simplify
 from sympy.testing.pytest import raises
 
 a, k, n, m, x = symbols('a,k,n,m,x', integer=True)
 f = Function('f')
+
+
+def test_polynomial_product_partial_roots():
+    q = k**5 - k + 1
+    assert product(q, (k, 1, n)) == Product(q, (k, 1, n))
+    assert product(3*q, (k, 1, n)) == Product(3*q, (k, 1, n))
+    expected = S.One
+    for j in range(1, 102):
+        expected *= j**5 - j + 1
+    assert product(q, (k, 1, 101)) == expected
+
+    p = (3*(k + 2)**2*q).expand()
+    result = product(p, (k, a, n))
+    assert result == rf(a + 2, n - a + 1)**2 * Product(3*q, (k, a, n))
+    assert result.doit() == result
+    for lower, upper in [(1, 4), (3, 2), (4, 1)]:
+        assert result.subs({a: lower, n: upper}).doit() == product(
+            p, (k, lower, upper))
+
+    p = ((2*k + 1)*(k + x)*q).expand()
+    assert product(p, (k, a, n)) == (
+        rf(a + S.Half, n - a + 1) * rf(a + x, n - a + 1)
+        * Product(2*q, (k, a, n)))
 
 
 def test_karr_convention():
@@ -257,6 +282,29 @@ def test_product_pow():
 def test_infinite_product():
     # issue 5737
     assert isinstance(Product(2**(1/factorial(n)), (n, 0, oo)), Product)
+
+
+def test_infinite_rational_product():
+    assert product(1 - 1/(4*k**2), (k, 1, oo)) == 2/pi
+    assert product(4*k**2/(4*k**2 - 1), (k, 1, oo)) == pi/2
+    assert product(1 + 1/k**2, (k, 1, oo)).simplify() == sinh(pi)/pi
+    p = (k*(k + 1) + 1 + I)/(k*(k + 1) + 1 - I)
+    assert product(p, (k, 0, oo)).simplify() == -1
+
+    p = (k*(k + 2)/(k + 1)**2)**2
+    assert product(p, (k, 1, oo)) == S.One/4
+    assert product(p, (k, 3, oo)) == Rational(9, 16)
+    assert product(1 - 4/k**2, (k, 1, oo)) == 0
+
+    z = Symbol('z')
+    p = 1 - z**2/k**2
+    result = product(p, (k, 1, oo))
+    assert result == 1/(gamma(1 - z)*gamma(1 + z))
+    assert result.subs(z, 0) == 1
+    for p in [1 + 1/(k - 2)**2, 1 + 1/(k - z)**2,
+              (k**5 - k + 2)/(k**5 - k + 1),
+              sqrt(1 - 6/k**2), (1 - 6/k**2)**Rational(1, 3)]:
+        assert product(p, (k, 1, oo)) == Product(p, (k, 1, oo))
 
 
 def test_conjugate_transpose():

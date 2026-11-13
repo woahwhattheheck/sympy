@@ -388,7 +388,7 @@ def test_matrix_derivatives_of_traces():
 
 def test_derivatives_of_complicated_matrix_expr():
     expr = a.T*(A*X*(X.T*B + X*A) + B.T*X.T*(a*b.T*(X*D*X.T + X*(X.T*B + A*X)*D*B - X.T*C.T*A)*B + B*(X*D.T + B*A*X*A.T - 3*X*D))*B + 42*X*B*X.T*A.T*(X + X.T))*b
-    result = (B*(B*A*X*A.T - 3*X*D + X*D.T) + a*b.T*(X*(A*X + X.T*B)*D*B + X*D*X.T - X.T*C.T*A)*B)*B*b*a.T*B.T + B**2*b*a.T*B.T*X.T*a*b.T*X*D + 42*A*X*B.T*X.T*a*b.T + B*D*B**3*b*a.T*B.T*X.T*a*b.T*X + B*b*a.T*A*X + a*b.T*(42*X + 42*X.T)*A*X*B.T + b*a.T*X*B*a*b.T*B.T**2*X*D.T + b*a.T*X*B*a*b.T*B.T**3*D.T*(B.T*X + X.T*A.T) + 42*b*a.T*X*B*X.T*A.T + A.T*(42*X + 42*X.T)*b*a.T*X*B + A.T*B.T**2*X*B*a*b.T*B.T*A + A.T*a*b.T*(A.T*X.T + B.T*X) + A.T*X.T*b*a.T*X*B*a*b.T*B.T**3*D.T + B.T*X*B*a*b.T*B.T*D - 3*B.T*X*B*a*b.T*B.T*D.T - C.T*A*B**2*b*a.T*B.T*X.T*a*b.T + X.T*A.T*a*b.T*A.T
+    result = (B*(B*A*X*A.T - 3*X*D + X*D.T) + a*b.T*(X*(A*X + X.T*B)*D*B + X*D*X.T - X.T*C.T*A)*B)*B*b*a.T*B.T + B**2*b*a.T*B.T*X.T*a*b.T*X*D + 42*A*X*B.T*X.T*a*b.T + B*D*B**3*b*a.T*B.T*X.T*a*b.T*X + B*b*a.T*A*X + 42*a*b.T*(X + X.T)*A*X*B.T + b*a.T*X*B*a*b.T*B.T**2*X*D.T + b*a.T*X*B*a*b.T*B.T**3*D.T*(B.T*X + X.T*A.T) + 42*b*a.T*X*B*X.T*A.T + 42*A.T*(X + X.T)*b*a.T*X*B + A.T*B.T**2*X*B*a*b.T*B.T*A + A.T*a*b.T*(A.T*X.T + B.T*X) + A.T*X.T*b*a.T*X*B*a*b.T*B.T**3*D.T + B.T*X*B*a*b.T*B.T*D - 3*B.T*X*B*a*b.T*B.T*D.T - C.T*A*B**2*b*a.T*B.T*X.T*a*b.T + X.T*A.T*a*b.T*A.T
     assert expr.diff(X) == result
 
 
@@ -823,6 +823,96 @@ def test_derivative_trace_of_hadamard_shape():
     d3 = Trace(HadamardPower(X2, 3)).diff(X2)
     assert d3.shape == (2, 2)
     assert d3.as_explicit() == Matrix([[3*X2[0, 0]**2, 0], [0, 3*X2[1, 1]**2]])
+
+
+def test_derivative_trace_of_hadamard_matrix_products():
+    # https://github.com/sympy/sympy/issues/30902 (item 1)
+    expr = Trace(HadamardProduct(A*X, B*X)*C)
+    expected = (A.T*HadamardProduct(B*X, C.T)
+                + B.T*HadamardProduct(A*X, C.T))
+    assert expr.diff(X) == expected
+
+    A2 = MatrixSymbol("A", 2, 2)
+    B2 = MatrixSymbol("B", 2, 2)
+    C2 = MatrixSymbol("C", 2, 2)
+    X2 = MatrixSymbol("X", 2, 2)
+    expr2 = expr.xreplace({A: A2, B: B2, C: C2, X: X2})
+    actual = expr2.diff(X2).as_explicit()
+    explicit = Trace(expr2.arg.as_explicit()).doit()
+    expected = Matrix(derive_by_array(explicit, X2.as_explicit()))
+    assert (actual - expected).expand() == ZeroMatrix(2, 2).as_explicit()
+
+
+def test_derivative_trace_of_composite_hadamard_factors():
+    # Array-to-matrix recognition must convert the ArrayAdd factor before
+    # constructing the Hadamard product (#30902, item 18).
+    expr = Trace(HadamardProduct(A + B, X)*C)
+    assert expr.diff(X) == HadamardProduct(A + B, C.T)
+
+    # A product of Hadamard products contains diagonal groups over already
+    # contracted operands (#30902, item 22).  Compare with the entrywise
+    # derivative to cover both the forward conversion and recognition.
+    A2 = MatrixSymbol("A", 2, 2)
+    B2 = MatrixSymbol("B", 2, 2)
+    C2 = MatrixSymbol("C", 2, 2)
+    X2 = MatrixSymbol("X", 2, 2)
+    expr = Trace(HadamardProduct(A2*X2, B2)*HadamardProduct(C2, X2))
+    actual = expr.diff(X2).as_explicit()
+    explicit = Trace(expr.arg.as_explicit()).doit()
+    expected = Matrix(derive_by_array(explicit, X2.as_explicit()))
+    assert (actual - expected).expand() == ZeroMatrix(2, 2).as_explicit()
+
+
+def test_elementwise_derivative_captured_matrix_parameters():
+    # https://github.com/sympy/sympy/issues/30902 (item 3)
+    # Both the mapped input and scalar parameters in the function depend
+    # on X, so both parts of the chain rule contribute.
+    X2 = MatrixSymbol("X", 2, 2)
+    expr = X2.applyfunc(lambda z: z**2*X2[0, 0])
+    actual = expr.diff(X2).as_explicit()
+    expected = derive_by_array(expr.as_explicit(), X2.as_explicit())
+    assert (actual - expected).applyfunc(lambda v: v.expand()) == \
+        Array.zeros(2, 2, 2, 2)
+
+    expr = HadamardPower(X2, Trace(X2))
+    actual = expr.diff(X2).as_explicit()
+    # This entry comes entirely from the exponent: the input element
+    # X[0, 1] is independent of the differentiation variable X[0, 0].
+    assert actual[0, 0, 0, 1] == X2[0, 1]**Trace(X2)*log(X2[0, 1])
+
+    a2 = MatrixSymbol("a", 2, 1)
+    b2 = MatrixSymbol("b", 2, 1)
+    expr = MatPow(a2.T*X2*b2, Trace(X2))
+    substitutions = {X2: Matrix([[2, 3], [5, 7]]),
+                     a2: Matrix([11, 13]), b2: Matrix([17, 19])}
+    actual = _explicit_numeric(expr.diff(X2), substitutions)
+    expected = Matrix(derive_by_array(expr.as_explicit()[0, 0], X2.as_explicit()))
+    expected = _explicit_numeric(expected, substitutions)
+    assert (actual - expected).applyfunc(lambda v: v.simplify()) == Array.zeros(2, 2)
+
+
+def test_elementwise_derivative_bound_parameters():
+    X2 = MatrixSymbol("X", 2, 2)
+    i = symbols("i", integer=True)
+    functions = [lambda z: Sum(z*X2[i, i], (i, 0, 1)),
+                 lambda z: Sum(z*X2[i, i], (i, 0, 1))**2]
+    for function in functions:
+        expr = X2.applyfunc(function)
+        actual = expr.diff(X2).as_explicit()
+        explicit = expr.as_explicit().applyfunc(lambda e: e.doit())
+        expected = derive_by_array(explicit, X2.as_explicit())
+        assert (actual - expected).applyfunc(lambda e: e.doit().expand()) == \
+            Array.zeros(2, 2, 2, 2)
+        assert i not in actual.free_symbols
+
+
+def test_elementwise_derivative_matrix_power():
+    X2 = MatrixSymbol("X", 2, 2)
+    expr = (X2**2).applyfunc(sin)
+    actual = expr.diff(X2).as_explicit()
+    expected = derive_by_array(expr.as_explicit(), X2.as_explicit())
+    assert (actual - expected).applyfunc(lambda e: e.expand()) == \
+        Array.zeros(2, 2, 2, 2)
 
 
 def test_derivative_trace_of_vector_hadamard():

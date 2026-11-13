@@ -31,7 +31,7 @@ from sympy.tensor.array.dense_ndim_array import ImmutableDenseNDimArray
 from sympy.tensor.array.ndim_array import NDimArray
 from sympy.tensor.indexed import (Indexed, IndexedBase)
 from sympy.matrices.expressions.matexpr import MatrixElement
-from sympy.tensor.array.expressions.utils import _apply_recursively_over_nested_lists, _sort_contraction_indices, \
+from sympy.tensor.array.expressions.utils import _avoid_bound_sum_capture, _apply_recursively_over_nested_lists, _sort_contraction_indices, \
     _get_mapping_from_sub_ndim_list, _build_push_indices_up_func_transformation, _get_contraction_links, \
     _build_push_indices_down_func_transformation
 from sympy.combinatorics import Permutation
@@ -194,23 +194,47 @@ class ArraySum(Sum, _ArrayExpr):
         obj = Sum.__new__(cls, function, *limits)
         return obj
 
+    def _concrete_terms(self, function):
+        """Expand finite integer limits, or return None for symbolic bounds."""
+        # Limits are ordered innermost first. Rename bound symbols before
+        # substituting outer indices into dependent inner bounds.
+        expr = self.func(function, *self.limits).as_dummy()
+        terms = []
+
+        def expand(function, limits, sign):
+            if not limits:
+                if sign == 1:
+                    terms.append(function)
+                elif isinstance(function, MatrixExpr):
+                    terms.append(-function)
+                else:
+                    terms.append(_array_tensor_product(S.NegativeOne, function))
+                return True
+            limit = limits[-1]
+            if len(limit) != 3 or not all(b.is_Integer for b in limit[1:]):
+                return False
+            variable, lower, upper = limit
+            lower, upper = int(lower), int(upper)
+            if upper < lower:
+                # Karr's convention: sum(a, b) = -sum(b + 1, a - 1).
+                lower, upper, sign = upper + 1, lower - 1, -sign
+            for value in range(lower, upper + 1):
+                substitution = {variable: Integer(value)}
+                inner_limits = tuple(l.xreplace(substitution) for l in limits[:-1])
+                if not expand(function.xreplace(substitution), inner_limits, sign):
+                    return False
+            return True
+
+        return terms if expand(expr.function, expr.limits, 1) else None
+
     def doit(self, **hints):
         deep = hints.get("deep", True)
         function = self.function.doit(**hints) if deep else self.function
-        limits = self.limits
-        if all(len(i) == 3 and i[1].is_Integer and i[2].is_Integer for i in limits):
-            # Expand the summation over the concrete integer limits. The
-            # summands are array expressions, so an ``ArrayAdd`` has to be
-            # used instead of a scalar ``Add`` (which would lose the array
-            # character of the expression, e.g. its shape):
-            if any(i[2] < i[1] for i in limits):
+        terms = self._concrete_terms(function)
+        if terms is not None:
+            if not terms:
                 return ZeroArray(*self.shape)
-            terms = []
-            for values in itertools.product(*[range(int(i[1]), int(i[2]) + 1) for i in limits]):
-                terms.append(function.subs(dict(zip([i[0] for i in limits], values))))
             if all(isinstance(term, MatrixExpr) for term in terms):
-                # The sum of matrix expressions is itself a valid matrix
-                # expression, no need for ``ArrayAdd``:
                 return reduce(operator.add, terms)
             return _array_add(*terms)
         done = super().doit(**hints)
@@ -219,20 +243,19 @@ class ArraySum(Sum, _ArrayExpr):
         return done
 
     def as_explicit(self):
-        limits = self.limits
-        if not all(len(i) == 3 and i[1].is_Integer and i[2].is_Integer for i in limits):
-            raise ValueError("cannot express explicit form of array sum with symbolic limits")
         if not all(i.is_Integer for i in self.shape):
             raise ValueError("cannot express explicit array with symbolic shape")
-        if any(i[2] < i[1] for i in limits):
+        terms = self._concrete_terms(self.function)
+        if terms is None:
+            raise ValueError("cannot express explicit form of array sum with symbolic limits")
+        if not terms:
             return ImmutableDenseNDimArray.zeros(*self.shape)
-        terms = []
-        for values in itertools.product(*[range(int(i[1]), int(i[2]) + 1) for i in limits]):
-            term = self.function.subs(dict(zip([i[0] for i in limits], values)))
+        explicit_terms = []
+        for term in terms:
             if hasattr(term, "as_explicit"):
                 term = term.as_explicit()
-            terms.append(term if isinstance(term, NDimArray) else ImmutableDenseNDimArray(term))
-        return reduce(operator.add, terms)
+            explicit_terms.append(term if isinstance(term, NDimArray) else ImmutableDenseNDimArray(term))
+        return reduce(operator.add, explicit_terms)
 
     def _eval_simplify(self, **kwargs):
         ret = super()._eval_simplify(**kwargs)
@@ -475,7 +498,10 @@ class ArrayTensorProduct(_ArrayExpr):
                     inverse_permutation.extend([cumulative_ndim_list[i] + j for j in range(get_ndim(arg))])
             inverse_permutation.extend(last_perm)
             tp = _array_tensor_product(*[arg.expr if isinstance(arg, ArrayDiagonal) else arg for arg in args])
-            ndims2 = [_get_sub_ndim(arg) if isinstance(arg, ArrayDiagonal) else get_ndim(arg) for arg in args]
+            # Diagonal indices refer to the immediate operand's axes, not
+            # to the underlying tensor product before any contractions.
+            # Those contracted axes are already absent from ``arg.expr``.
+            ndims2 = [get_ndim(arg.expr) if isinstance(arg, ArrayDiagonal) else get_ndim(arg) for arg in args]
             cumulative_ndims2 = list(accumulate([0] + ndims2))[:-1]
             diagonal_indices = [tuple(cumulative_ndims2[i] + k for k in j) for i, arg in diagonals.items() for j in arg.diagonal_indices]
             return _permute_dims(_array_diagonal(tp, *diagonal_indices), _af_invert(inverse_permutation))
@@ -1171,6 +1197,7 @@ class ArrayElementwiseApplyFunc(_ArrayExpr):
             d = Dummy('d')
             function = Lambda(d, function(d))
 
+        function = _avoid_bound_sum_capture(function, element)
         obj = _ArrayExpr.__new__(cls, function, element)
         obj._sub_ndim_list = _get_sub_ndim_list(element)
         return obj

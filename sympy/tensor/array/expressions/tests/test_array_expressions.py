@@ -1198,3 +1198,30 @@ def test_array_expressions_base_class():
     expr = ArrayAdd(A3, B3)
     assert expr[i, j] == ArrayElement(expr, (i, j))
     raises(IndexError, lambda: expr[i])
+
+
+def test_array_sum_dependent_and_reversed_limits():
+    for operand in (MatrixSymbol("X", 2, 2), ArraySymbol("T", (2, 2, 2))):
+        for limits in [
+            ((i, 0, j), (j, 0, 2)),
+            ((i, 3, 0),),
+            ((i, 0, j), (j, 3, 0)),
+            ((i, 0, j), (j, 2, 1)),
+            ((i, 3, j), (j, 0, 2)),
+        ]:
+            coefficient = i + 2*j
+            expected = ImmutableDenseNDimArray(operand.as_explicit()) * Sum(coefficient, *limits).doit()
+            expr = ArraySum(ArrayTensorProduct(coefficient, operand), *limits)
+            actual = expr.as_explicit()
+            evaluated = ImmutableDenseNDimArray(expr.doit().as_explicit())
+            assert (actual - expected).applyfunc(lambda e: e.expand()) == Array.zeros(*operand.shape)
+            assert (evaluated - expected).applyfunc(lambda e: e.expand()) == Array.zeros(*operand.shape)
+
+
+def test_array_sum_shadowed_bound_symbols():
+    operand = MatrixSymbol("X", 2, 2)
+    coefficient = i * Sum(i, (i, 0, 2))
+    expr = ArraySum(ArrayTensorProduct(coefficient, operand), (i, 0, 2))
+    expected = ImmutableDenseNDimArray(9*operand.as_explicit())
+    assert expr.as_explicit().applyfunc(lambda e: e.doit()) == expected
+    assert ImmutableDenseNDimArray(expr.doit().as_explicit()) == expected

@@ -245,7 +245,13 @@ def _(expr: ZeroArray):
 
 @_array2matrix.register(ArrayTensorProduct)
 def _(expr: ArrayTensorProduct):
-    return _a2m_tensor_product(*[_array2matrix(arg) for arg in expr.args])
+    args = []
+    for arg in expr.args:
+        converted = _array2matrix(arg)
+        # Row/column sums can become matrices with an extra size-one axis.
+        # Preserve the axes referenced by enclosing array operations.
+        args.append(converted if get_shape(converted) == get_shape(arg) else arg)
+    return _a2m_tensor_product(*args)
 
 
 @_array2matrix.register(ArraySum)
@@ -258,6 +264,9 @@ def _(expr: ArraySum):
         # expression, while ``simplify`` below may rebuild a scalar ``Sum``
         # of matrices, which has no shape:
         return output.doit(deep=False)
+    if isinstance(new_function, _ArrayExpr):
+        # Scalar Sum simplification need not preserve array operations.
+        return output
     simplified = output.simplify()
     if get_shape(simplified) != get_shape(output):
         # Simplification lost the array character of the expression (e.g. it
@@ -319,7 +328,9 @@ def _(expr: ArrayDiagonal):
     pexpr = identify_hadamard_products(pexpr)
     if isinstance(pexpr, ArrayDiagonal):
         pexpr = _array_diag2contr_diagmatrix(pexpr)
-    if expr == pexpr:
+    # Rebuilding an ArraySum can rename its bound indices without changing
+    # the expression. Such a conversion has already reached a fixed point.
+    if expr == pexpr or (expr.has(ArraySum) and expr.as_dummy() == pexpr.as_dummy()):
         return expr
     return _array2matrix(pexpr)
 
@@ -935,6 +946,15 @@ def identify_hadamard_products(expr: ArrayContraction | ArrayDiagonal):
 
     editor: _EditArrayContraction = _EditArrayContraction(expr)
 
+    # Recognition below builds matrix products and traces.  Convert each
+    # factor first so an ArrayAdd or elementwise array operation is not
+    # mistaken for a scalar by the matrix constructors.  Keep the editor's
+    # index labels by accepting only conversions with the same axes.
+    for arg_with_ind in editor.args_with_ind:
+        converted = _array2matrix(arg_with_ind.element)
+        if get_shape(converted) == get_shape(arg_with_ind.element):
+            arg_with_ind.element = converted
+
     map_contr_to_args: dict[frozenset, list[_ArgE]] = defaultdict(list)
     map_ind_to_inds: dict[int | None, int] = defaultdict(int)
     for arg_with_ind in editor.args_with_ind:
@@ -947,6 +967,9 @@ def identify_hadamard_products(expr: ArrayContraction | ArrayDiagonal):
     k: frozenset[int]
     v: list[_ArgE]
     for k, v in map_contr_to_args.items():
+        if not all(isinstance(i.element, (MatrixExpr, MatrixBase)) for i in v):
+            # A rank-2 array need not have a matrix representation.
+            continue
         make_trace: bool = False
         if len(k) == 1 and next(iter(k)) < 0:
             # Negative indices are diagonal indices: the arguments in ``v``
@@ -999,7 +1022,11 @@ def identify_hadamard_products(expr: ArrayContraction | ArrayDiagonal):
                 continue
 
         def check_transpose(x):
-            x = [i if i >= 0 else -1-i for i in x]
+            # Contraction and diagonal groups have independent numberings.
+            # Keep the group type when ordering axes: contraction 0 and
+            # diagonal -1 must not both become 0, otherwise opposite
+            # orientations of the same two axes can both appear sorted.
+            x = [(i if i >= 0 else -1-i, i < 0) for i in x]
             return x == sorted(x)
 
         # Check if expression is a trace:

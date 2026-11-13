@@ -48,16 +48,25 @@ class ElementwiseApplyFunction(MatrixExpr):
     """
 
     def __new__(cls, function, expr):
+        # Array differentiation imports this class during package initialization.
+        from sympy.tensor.array.expressions.utils import _avoid_bound_sum_capture
+
         expr = _sympify(expr)
         if not expr.is_Matrix:
             raise ValueError("{} must be a matrix instance.".format(expr))
 
+        function = _avoid_bound_sum_capture(function, expr)
         if expr.shape == (1, 1):
-            # Check if the function returns a matrix, in that case, just apply
-            # the function instead of creating an ElementwiseApplyFunc object:
-            ret = function(expr)
-            if isinstance(ret, MatrixExpr):
-                return ret
+            # Some scalar maps also have a matrix representation, e.g. 2*d.
+            # This is only an optimization: a valid scalar map such as
+            # d**p*log(d) need not accept a matrix as its argument.
+            try:
+                ret = function(expr)
+            except (TypeError, NotImplementedError):
+                pass
+            else:
+                if isinstance(ret, MatrixExpr):
+                    return ret
 
         if not isinstance(function, (FunctionClass, Lambda)):
             d = Dummy('d')
@@ -77,6 +86,7 @@ class ElementwiseApplyFunction(MatrixExpr):
             d = Dummy('d')
             function = Lambda(d, function(d))
 
+        function = _avoid_bound_sum_capture(function, expr)
         obj = MatrixExpr.__new__(cls, function, expr)
         return obj
 
@@ -131,10 +141,15 @@ class ElementwiseApplyFunction(MatrixExpr):
         from sympy.matrices.expressions.hadamard import hadamard_product
         dexpr = self.expr.diff(x)
         fdiff = self._get_function_fdiff()
-        return hadamard_product(
+        result = hadamard_product(
             dexpr,
             ElementwiseApplyFunction(fdiff, self.expr)
         )
+        d = Dummy("d")
+        partial = self.function(d).diff(x)
+        if partial != 0:
+            result += ElementwiseApplyFunction(Lambda(d, partial), self.expr)
+        return result
 
     def _eval_transpose(self):
         from sympy.matrices.expressions.transpose import Transpose

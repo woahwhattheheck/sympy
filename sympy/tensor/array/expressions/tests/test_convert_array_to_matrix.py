@@ -642,6 +642,63 @@ def test_convert_array_to_hadamard_products():
     assert convert_array_to_matrix(cg).dummy_eq(X4*X1.applyfunc(exp)*X1**2)
 
 
+def test_hadamard_product_mixed_contraction_and_diagonal_axes():
+    # https://github.com/sympy/sympy/issues/30902 (item 1)
+    # A matrix product inside the Hadamard product introduces contraction
+    # groups alongside diagonal groups.  Their numbers must stay distinct
+    # when deciding whether to transpose a factor.
+    expr = HadamardProduct(A*B, M)*N
+    assert convert_array_to_matrix(convert_matrix_to_array(expr)) == expr
+
+    expr = HadamardProduct(A*B, M.T)*N
+    assert convert_array_to_matrix(convert_matrix_to_array(expr)) == expr
+
+    A23 = MatrixSymbol("A", 2, 3)
+    B34 = MatrixSymbol("B", 3, 4)
+    M24 = MatrixSymbol("M", 2, 4)
+    N45 = MatrixSymbol("N", 4, 5)
+    expr = HadamardProduct(A23*B34, M24)*N45
+    assert convert_array_to_matrix(convert_matrix_to_array(expr)) == expr
+    assert convert_array_to_matrix(convert_matrix_to_array(expr.T)) == expr.T
+
+
+def test_hadamard_and_trace_convert_array_factors():
+    # https://github.com/sympy/sympy/issues/30902 (items 9 and 18)
+    expr = Trace((A + B)*C)
+    assert convert_array_to_matrix(convert_matrix_to_array(expr)) == expr
+
+    expr = Trace((A + B)*C.applyfunc(exp))
+    assert convert_array_to_matrix(convert_matrix_to_array(expr)) == expr
+
+    expr = Trace(HadamardProduct(A + B, C))
+    assert convert_array_to_matrix(convert_matrix_to_array(expr)) == \
+        Trace(HadamardProduct(A.T + B.T, C.T))
+
+    R = MatrixSymbol("R", 3, 2)
+    S = MatrixSymbol("S", 2, 3)
+    expr = Trace(R*(S + R.T))
+    actual = convert_array_to_matrix(convert_matrix_to_array(expr))
+    assert (actual.arg.as_explicit().trace()
+            - expr.arg.as_explicit().trace()).expand() == 0
+
+
+def test_product_of_composite_hadamard_products():
+    # https://github.com/sympy/sympy/issues/30902 (item 22)
+    expr = HadamardProduct(A*X, B)*HadamardProduct(C, X)
+    assert convert_array_to_matrix(convert_matrix_to_array(expr)) == expr
+
+
+def test_hadamard_conversion_preserves_factor_axes():
+    M23 = MatrixSymbol("M", 2, 3)
+    N22 = MatrixSymbol("N", 2, 2)
+    expr = ArrayDiagonal(
+        ArrayTensorProduct(ArrayContraction(M23, (1,)), N22), (0, 1))
+    result = convert_array_to_matrix(expr)
+    assert result.shape == expr.shape
+    assert (result.as_explicit() - expr.as_explicit()).applyfunc(
+        lambda e: e.expand()) == Array.zeros(2, 2)
+
+
 def test_identify_removable_identity_matrices():
 
     D = DiagonalMatrix(MatrixSymbol("D", k, k))

@@ -9,6 +9,7 @@ from sympy.core.singleton import S
 from sympy.core.symbol import Dummy, Symbol
 from sympy.functions.combinatorial.factorials import RisingFactorial
 from sympy.functions.elementary.exponential import exp, log
+from sympy.functions.special.gamma_functions import gamma
 from sympy.functions.special.tensor_functions import KroneckerDelta
 from sympy.polys import quo, roots
 from typing import TYPE_CHECKING
@@ -314,27 +315,36 @@ class Product(ExprWithIntLimits):
 
         dif = n - a
         definite = dif.is_Integer
+        if n is S.Infinity and a.is_finite and term.is_rational_function(k):
+            result = self._eval_product_rational_infinite(term, k, a)
+            if result is not None:
+                return result
+
         if definite and (dif < 100):
             return self._eval_product_direct(term, limits)
 
         elif term.is_polynomial(k):
             poly = term.as_poly(k)
 
-            A = B = Q = S.One
-
             all_roots = roots(poly)
+            if not all_roots:
+                if definite:
+                    return self._eval_product_direct(term, limits)
+                return None
+
+            A = Q = S.One
 
             M = 0
             for r, m in all_roots.items():
                 M += m
                 A *= RisingFactorial(a - r, n - a + 1)**m
-                Q *= (n - r)**m
+                Q *= (k - r)**m
 
             if M < poly.degree():
-                arg = quo(poly, Q.as_poly(k))
-                B = self.func(arg, (k, a, n)).doit()
+                arg = quo(poly, Q.as_poly(k)).as_expr()
+                return A * self.func(arg, (k, a, n))
 
-            return poly.LC()**(n - a + 1) * A * B
+            return poly.LC()**(n - a + 1) * A
 
         elif term.is_Add:
             factored = factor_terms(term, fraction=True)
@@ -377,6 +387,9 @@ class Product(ExprWithIntLimits):
 
                 return term.base**s
             elif not term.exp.has(k):
+                if (n is S.Infinity and term.exp.is_integer is not True
+                        and term.base.is_positive is not True):
+                    return None
                 p = self._eval_product(term.base, (k, a, n))
 
                 if p is not None:
@@ -392,6 +405,35 @@ class Product(ExprWithIntLimits):
 
         if definite:
             return self._eval_product_direct(term, limits)
+
+    def _eval_product_rational_infinite(self, term, k, a):
+        """Evaluate balanced rational products using DLMF 5.8.5."""
+        numer, denom = (part.as_poly(k) for part in term.as_numer_denom())
+        degree = denom.degree()
+        if (degree < 1 or numer.degree() != degree
+                or numer.LC() != denom.LC()
+                or numer.nth(degree - 1) != denom.nth(degree - 1)):
+            return None
+
+        denom_roots = roots(denom)
+        if sum(denom_roots.values()) != degree:
+            return None
+        for root in denom_roots:
+            shift = a - root
+            if not (shift.is_integer is False or shift.is_positive is True):
+                return None
+
+        numer_roots = roots(numer)
+        if sum(numer_roots.values()) != degree:
+            return None
+
+        # Matching the two leading coefficients gives equal root sums, so
+        # the powers of the truncation index cancel in the gamma ratio.
+        numer_gamma = Mul(*(gamma(a - root)**m
+                            for root, m in denom_roots.items()))
+        denom_gamma = Mul(*(gamma(a - root)**m
+                            for root, m in numer_roots.items()))
+        return numer_gamma / denom_gamma
 
     def _eval_simplify(self, **kwargs):
         from sympy.simplify.simplify import product_simplify
@@ -593,7 +635,7 @@ def product(*args, **kwargs):
     Examples
     ========
 
-    >>> from sympy import product, symbols
+    >>> from sympy import oo, product, symbols
     >>> i, n, m, k = symbols('i n m k', integer=True)
 
     >>> product(i, (i, 1, k))
@@ -602,6 +644,11 @@ def product(*args, **kwargs):
     m**k
     >>> product(i, (i, 1, k), (k, 1, n))
     Product(factorial(k), (k, 1, n))
+
+    Balanced rational functions can also be multiplied over an infinite range:
+
+    >>> product(1 - 1/(4*k**2), (k, 1, oo))
+    2/pi
 
     """
 

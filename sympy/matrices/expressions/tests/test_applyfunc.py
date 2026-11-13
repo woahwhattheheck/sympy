@@ -128,3 +128,10 @@ def test_derivative_keeps_function_argument():
     assert dexpr[0, 0, 0, 0] == exp(X[0, 0] + 1)
     assert dexpr[1, 2, 1, 2] == exp(X[1, 2] + 1)
     assert dexpr[0, 0, 0, 1] == 0
+
+
+def test_derivative_captured_scalar_parameter():
+    s = symbols("s")
+    expr = (s*X).applyfunc(lambda z: s*z**2)
+    assert (expr.diff(s).as_explicit()
+            - expr.as_explicit().diff(s)).expand() == Matrix.zeros(3)
